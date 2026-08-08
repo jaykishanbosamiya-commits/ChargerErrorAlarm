@@ -1,175 +1,149 @@
 package com.example.chargererroralarm
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
-import android.content.BroadcastReceiver
-import android.content.Context
+import android.app.*
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.Ringtone
 import android.media.RingtoneManager
-import android.os.BatteryManager
-import android.os.Build
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.os.*
 import androidx.core.app.NotificationCompat
 
 class ChargerMonitorService : Service() {
+    companion object {
+        const val CHANNEL_ID = "charger_monitor"
+        const val NOTIFICATION_ID = 10
+        const val INTERVAL = 2000L
+    }
 
     private val handler = Handler(Looper.getMainLooper())
-    private var chargerConnected = false
+    private var monitoring = false
+    private var badSince = 0L
     private var alarmPlaying = false
     private var ringtone: Ringtone? = null
-    private lateinit var powerReceiver: BroadcastReceiver
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-        startForeground(10, buildNotification("Monitoring charger status"))
-
-        powerReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                when (intent?.action) {
-                    Intent.ACTION_POWER_CONNECTED -> {
-                        chargerConnected = true
-                        checkAfterDelay()
-                    }
-                    Intent.ACTION_POWER_DISCONNECTED -> {
-                        chargerConnected = false
-                        stopAlarm()
-                        updateNotification("Charger disconnected")
-                    }
-                    Intent.ACTION_BATTERY_CHANGED -> {
-                        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-                        val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
-                        chargerConnected = plugged != 0
-                        if (chargerConnected) {
-                            if (status == BatteryManager.BATTERY_STATUS_CHARGING) {
-                                stopAlarm()
-                                updateNotification("Charging normally")
-                            } else {
-                                checkAfterDelay()
-                            }
-                        } else {
-                            stopAlarm()
-                            updateNotification("Charger disconnected")
-                        }
-                    }
-                }
-            }
-        }
-
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_POWER_CONNECTED)
-            addAction(Intent.ACTION_POWER_DISCONNECTED)
-            addAction(Intent.ACTION_BATTERY_CHANGED)
-        }
-
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(powerReceiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(powerReceiver, filter)
+    private val checker = object : Runnable {
+        override fun run() {
+            if (!monitoring) return
+            checkState()
+            handler.postDelayed(this, INTERVAL)
         }
     }
 
-    private fun checkAfterDelay() {
-        handler.removeCallbacksAndMessages(null)
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+    }
 
-        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        if (!prefs.getBoolean("enabled", true)) {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!monitoring) {
+            startAsForeground()
+            monitoring = true
+            handler.post(checker)
+        }
+        return START_STICKY
+    }
+
+    private fun startAsForeground() {
+        val n = notification("Monitoring charger status")
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, n)
+        }
+    }
+
+    private fun checkState() {
+        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val status = i?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val plugged = i?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+        val connected = plugged != 0
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING
+
+        if (!connected) {
+            badSince = 0
             stopAlarm()
+            update("Monitoring: charger disconnected")
             return
         }
 
-        val delaySeconds = prefs.getInt("delay_seconds", 5)
+        if (charging) {
+            badSince = 0
+            stopAlarm()
+            update("Charging normally")
+            return
+        }
 
-        handler.postDelayed({
-            val batteryManager = getSystemService(BATTERY_SERVICE) as BatteryManager
-            val isCharging = batteryManager.isCharging
+        if (!getSharedPreferences("settings", MODE_PRIVATE).getBoolean("enabled", true)) {
+            badSince = 0
+            stopAlarm()
+            update("Alarm disabled")
+            return
+        }
 
-            if (chargerConnected && !isCharging) {
-                startAlarm()
-                updateNotification("ERROR: charger connected but NOT charging")
-            } else {
-                stopAlarm()
-                updateNotification("Charging normally")
-            }
-        }, delaySeconds * 1000L)
+        if (badSince == 0L) badSince = System.currentTimeMillis()
+        val delay = getSharedPreferences("settings", MODE_PRIVATE).getInt("delay_seconds", 5) * 1000L
+        val elapsed = System.currentTimeMillis() - badSince
+
+        if (elapsed >= delay) {
+            startAlarm()
+            update("ERROR: charger connected but NOT charging")
+        } else {
+            val remaining = ((delay - elapsed + 999) / 1000)
+            update("Charger connected — checking (${remaining}s)")
+        }
     }
 
     private fun startAlarm() {
         if (alarmPlaying) return
-        alarmPlaying = true
-
         val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-
         ringtone = RingtoneManager.getRingtone(applicationContext, uri)
         ringtone?.audioAttributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_ALARM)
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
-        ringtone?.isLooping = true
+        if (Build.VERSION.SDK_INT >= 28) ringtone?.isLooping = true
         ringtone?.play()
+        alarmPlaying = true
 
-        val vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
-        if (vibrator.hasVibrator()) {
-            vibrator.vibrate(
-                VibrationEffect.createWaveform(
-                    longArrayOf(0, 400, 300),
-                    0
-                )
-            )
-        }
+        val v = getSystemService(VIBRATOR_SERVICE) as Vibrator
+        if (v.hasVibrator()) v.vibrate(VibrationEffect.createWaveform(longArrayOf(0,500,300), 0))
     }
 
     private fun stopAlarm() {
         if (!alarmPlaying) return
-        alarmPlaying = false
         ringtone?.stop()
         ringtone = null
-
-        val vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
-        vibrator.cancel()
+        alarmPlaying = false
+        (getSystemService(VIBRATOR_SERVICE) as Vibrator).cancel()
     }
 
-    private fun createNotificationChannel() {
+    private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel(
-                "charger_monitor",
-                "Charger Monitoring",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            channel.description = "Shows charger monitoring status"
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(channel)
+            val c = NotificationChannel(CHANNEL_ID, "Charger Monitoring", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(c)
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        return NotificationCompat.Builder(this, "charger_monitor")
+    private fun notification(text: String): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Charger Error Alarm")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
-    }
 
-    private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(10, buildNotification(text))
+    private fun update(text: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
     }
 
     override fun onDestroy() {
+        monitoring = false
         handler.removeCallbacksAndMessages(null)
         stopAlarm()
-        unregisterReceiver(powerReceiver)
         super.onDestroy()
     }
 
